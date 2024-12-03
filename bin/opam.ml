@@ -292,6 +292,51 @@ let report_user_option_use user =
   | None -> ()
   | Some _ -> App_log.unhappy (fun l -> l "%s" Deprecate.Config_user.option_use)
 
+let read_package_opam path =
+  (* NOTE: We use OpamFile.OPAM.read_from_channel instead of OpamFile.OPAM.file
+     to prevent the name and version fields being automatically added *)
+  In_channel.with_open_text path @@ fun ic ->
+  try Ok (OpamFile.OPAM.read_from_channel ic)
+  with
+  | OpamPp.Bad_format ((_, msg) : OpamPp.bad_format)
+  | OpamPp.Bad_version (((_, msg) : OpamPp.bad_format), _)
+    -> Error (`Msg msg)
+
+let opam_ci_lint ~remote_config ~pkgs () =
+  let open Opam_ci_check_lint in
+  let pkg_to_opam_package pkg =
+    let pkg_name = (Pkg.name pkg |> Result.get_ok) in
+    let pkg_version = (Pkg.version pkg |> Result.get_ok) |> Version.to_string in
+      OpamPackage.of_string (Printf.sprintf "%s.%s" pkg_name pkg_version)
+  in
+  let opam_repo_dir = remote_config.Config.Opam_repo_fork.local |> Fpath.to_string in
+  App_log.status (fun l -> l "Running opam-ci-lint on pakages");
+  let lint_meta = List.filter_map (fun p ->
+      let pkg = pkg_to_opam_package p in
+      let newly_published = None in   (* Lint lib can infer this *)
+      let result = get_pkg_dir p >>= fun pkg_src_dir ->
+      let src_dir = Fpath.(pkg_src_dir |> parent |> parent |> to_string) in
+      let opam_path = (Fpath.(to_string (pkg_src_dir / "opam"))) in
+      read_package_opam opam_path >>= fun opam ->
+      let url = opam.OpamFile.OPAM.url in
+      (match url with
+      | Some url -> App_log.status (fun l -> l "URL: %s" (OpamUrl.to_string (OpamFile.URL.url url)));
+      | _ -> ());
+      Ok (Lint.v ~pkg ~pkg_src_dir:(Some src_dir) ~newly_published opam)
+      in
+      match result with
+      | Ok l -> Some l
+      | Error _ -> None
+    ) pkgs in
+  match Lint.lint_packages ~opam_repo_dir lint_meta with
+  | Ok [] -> App_log.status (fun l -> l "Found no errors");
+               Ok ()
+  | Ok errors ->
+    (App_log.unhappy (fun l -> l "Found %d errors" (List.length errors)));
+    List.iter (fun e -> App_log.unhappy (fun l -> l "%s" (Lint.msg_of_error e))) errors;
+    Error (`Msg "Found errors")
+  | Error msg -> Error (`Msg msg)
+
 let submit ?local_repo:local ?remote_repo:remote ?opam_repo ?user ?token
     ~dry_run ~pkgs ~pkg_names ~no_auto_open ~yes ~draft () =
   let opam_repo =
@@ -304,8 +349,10 @@ let submit ?local_repo:local ?remote_repo:remote ?opam_repo ?user ?token
   Config.auto_open ~no_auto_open >>= fun auto_open ->
   App_log.status (fun m ->
       m "Submitting %a" Fmt.(list ~sep:sp Text.Pp.name) pkg_names);
-  submit ~token ~dry_run ~yes ~opam_repo ~pkgs_to_submit:pkg_names remote_config
-    pkgs auto_open ~draft
+  match opam_ci_lint ~remote_config ~pkgs () with
+  | Error _ -> exit 1;
+  | Ok _ -> submit ~token ~dry_run ~yes ~opam_repo ~pkgs_to_submit:pkg_names remote_config
+              pkgs auto_open ~draft
 
 let field ~pkgs ~field_name = field pkgs field_name
 
